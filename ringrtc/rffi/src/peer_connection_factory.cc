@@ -41,7 +41,9 @@
 namespace webrtc {
 namespace rffi {
 
-#if !defined(WEBRTC_IOS) && !defined(WEBRTC_ANDROID)
+// On the watch WEBRTC_IOS is defined (it builds as an iOS variant) but there
+// is no ObjC SDK to create the factory, so it takes the desktop route here.
+#if (!defined(WEBRTC_IOS) || defined(RINGRTC_WATCHOS)) && !defined(WEBRTC_ANDROID)
 // This class adds simulcast support to the base factory and is modeled using
 // the same business logic found in BuiltinVideoEncoderFactory and
 // InternalEncoderFactory.
@@ -232,14 +234,16 @@ class PeerConnectionFactoryWithOwnedThreads
   std::unique_ptr<rffi::InjectableNetwork> injectable_network_;
   const scoped_refptr<PeerConnectionFactoryInterface> factory_;
 };
-#endif  // !defined(WEBRTC_IOS) && !defined(WEBRTC_ANDROID)
+#endif  // (!defined(WEBRTC_IOS) || defined(RINGRTC_WATCHOS)) && !defined(WEBRTC_ANDROID)
 
 // Returns an owned RC.
 RUSTEXPORT PeerConnectionFactoryOwner* Rust_createPeerConnectionFactory(
     const RffiAudioConfig* audio_config_borrowed,
     bool use_injectable_network,
     const char* field_trials_string) {
-#if !defined(WEBRTC_IOS) && !defined(WEBRTC_ANDROID)
+// On the watch WEBRTC_IOS is defined (it builds as an iOS variant) but there
+// is no ObjC SDK to create the factory, so it takes the desktop route here.
+#if (!defined(WEBRTC_IOS) || defined(RINGRTC_WATCHOS)) && !defined(WEBRTC_ANDROID)
   auto factory_owner = PeerConnectionFactoryWithOwnedThreads::Create(
       audio_config_borrowed, use_injectable_network, field_trials_string);
   return take_rc(std::move(factory_owner));

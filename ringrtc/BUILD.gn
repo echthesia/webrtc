@@ -15,12 +15,16 @@ if (is_android) {
 }
 
 if (is_ios) {
+  import("//build/config/apple/mobile_config.gni")
+}
+
+if (is_ios && target_platform != "watchos") {
   group("ringrtc") {
     # @note The RingRTC build is done outside of gn/ninja...
   }
 }
 
-if (is_linux || is_mac || is_win) {
+if (is_linux || is_mac || is_win || (is_ios && target_platform == "watchos")) {
   import("//webrtc.gni")
 
   rtc_library("ringrtc") {

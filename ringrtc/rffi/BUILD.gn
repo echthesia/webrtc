@@ -24,6 +24,12 @@ common_sources = [
 config("ringrtc_rffi_config") {
   include_dirs = [ ".." ]
   defines = [ "ENABLE_RINGRTC" ]
+  if (is_ios && target_platform == "watchos") {
+    # WEBRTC_IOS is defined on the watch too (it is an iOS variant to the
+    # build), but the factory is created here in C++ as on desktop, not by
+    # the ObjC SDK. See peer_connection_factory.cc.
+    defines += [ "RINGRTC_WATCHOS" ]
+  }
 }
 
 if (is_android) {
@@ -64,6 +70,10 @@ if (is_android) {
 }
 
 if (is_ios) {
+  import("//build/config/apple/mobile_config.gni")
+}
+
+if (is_ios && target_platform != "watchos") {
   import("//build/config/ios/ios_sdk.gni")
   import("//build/config/ios/rules.gni")
 
@@ -81,7 +91,7 @@ if (is_ios) {
   }
 }
 
-if (is_linux || is_mac || is_win) {
+if (is_linux || is_mac || is_win || (is_ios && target_platform == "watchos")) {
   rtc_library("libringrtc_rffi") {
     visibility = [ "*" ]
 

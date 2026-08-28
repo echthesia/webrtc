@@ -25,6 +25,9 @@ import("//build/config/linux/pkg_config.gni")
 import("//build/config/sanitizers/sanitizers.gni")
 import("//testing/test.gni")
 import("webrtc.gni")
+if (is_ios) {
+  import("//build/config/apple/mobile_config.gni")
+}
 
 if (rtc_rust) {
   import("//build/rust/rust_unit_tests_group.gni")
@@ -616,7 +619,10 @@ if (!build_with_chromium) {
       if (is_android) {
         deps += [ "sdk/android" ]
       }
-      if (is_ios) {
+      if (is_ios && target_platform != "watchos") {
+        # The ObjC SDK is UIKit-shaped (UIDevice, UIApplication, camera,
+        # GL views) and none of it exists on the watch. RingRTC on watchOS
+        # takes the desktop route instead: rffi builds the factory in C++.
         deps += [ "sdk:framework_objc" ]
       }
     }
