@@ -31,6 +31,9 @@
 #include "rffi/api/peer_connection_factory.h"
 #include "rffi/api/peer_connection_observer_intf.h"
 #include "rffi/src/audio_device.h"
+#if defined(RINGRTC_WATCHOS)
+#include "rffi/src/watchos/audio_device_watchos.h"
+#endif
 #include "rffi/src/peer_connection_observer.h"
 #include "rffi/src/ptr.h"
 #include "rffi/src/rtp_observer.h"
@@ -93,7 +96,13 @@ class AudioDeviceModuleCleanup {
   AudioDeviceModuleCleanup(void (*free_adm_cb)(const void*), void* rust_adm)
       : free_adm_cb_(free_adm_cb), adm_(rust_adm) {}
 
-  ~AudioDeviceModuleCleanup() { free_adm_cb_(adm_); }
+  ~AudioDeviceModuleCleanup() {
+    // Null on the watch: the ADM there is C++ (WatchAudioDeviceModule), so
+    // there is no Rust-side reference to drop.
+    if (free_adm_cb_ != nullptr) {
+      free_adm_cb_(adm_);
+    }
+  }
 
  private:
   void (*free_adm_cb_)(const void*);
@@ -145,9 +154,18 @@ class PeerConnectionFactoryWithOwnedThreads
     // because the PeerConnectionFactory keeps its own reference.
     auto adm =
         worker_thread->BlockingCall([&]() -> scoped_refptr<AudioDeviceModule> {
+#if defined(RINGRTC_WATCHOS)
+          // The watch's ADM is ObjC++ on AVAudioEngine rather than the
+          // Rust-callback one: there is no reason for a 10 ms frame to cross
+          // the FFI boundary a hundred times a second when the Rust side
+          // would only forward it. rust_adm_borrowed and the callbacks are
+          // null there.
+          return WatchAudioDeviceModule::Create();
+#else
           return RingRTCAudioDeviceModule::Create(
               audio_config_borrowed->rust_adm_borrowed,
               audio_config_borrowed->rust_audio_device_callbacks);
+#endif
         });
 
     dependencies.adm = adm;

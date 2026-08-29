@@ -108,5 +108,36 @@ if (is_linux || is_mac || is_win || (is_ios && target_platform == "watchos")) {
       "//sdk:media_constraints",
       "//media:rtc_simulcast_encoder_adapter",
     ]
+
+    if (is_ios && target_platform == "watchos") {
+      # The watch's audio device module. iOS gets its ADM from the ObjC SDK
+      # (sdk/objc/native/src/audio, on AudioUnit/VoiceProcessingIO); the watch
+      # has neither the ObjC SDK in this build nor AudioToolbox in its SDK, so
+      # the ADM is ObjC++ on AVFAudio and lives here.
+      sources += [
+        "src/watchos/audio_device_watchos.h",
+        "src/watchos/audio_device_watchos.mm",
+      ]
+
+      # ARC is already on for .mm in this tree: rtc_common_configs adds
+      # //build/config/compiler:enable_arc for is_ios. See webrtc.gni.
+      frameworks = [
+        "AVFAudio.framework",
+        "Foundation.framework",
+      ]
+
+      deps += [
+        "//api:make_ref_counted",
+        "//api:scoped_refptr",
+        "//api:sequence_checker",
+        "//api/units:time_delta",
+        "//rtc_base:logging",
+        "//rtc_base:macromagic",
+        "//rtc_base:platform_thread",
+        "//rtc_base:rtc_event",
+        "//rtc_base:timeutils",
+        "//rtc_base/synchronization:mutex",
+      ]
+    }
   }
 }
