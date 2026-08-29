@@ -30,6 +30,15 @@ class WatchAudioEngine;
 // AVFAudio, so this ADM is AVAudioEngine underneath -- an input tap for
 // capture, an AVAudioSourceNode for playout.
 //
+// What crosses it is mono int16 at the engine's own rate, not at a rate this
+// module declares. AudioTransport takes samples_per_sec on every call and
+// resamples above us, so a route change is a new rate reported to the
+// transport rather than a converter rebuilt underneath one -- the same shape
+// as the iOS ADM's HandleSampleRateChange. Playout and capture rates are
+// tracked separately, and audio already buffered at the old rate is dropped
+// rather than played out at the new one, so a route change costs a gap and
+// nothing else.
+//
 // It is C++ rather than the Rust-callback ADM (RingRTCAudioDeviceModule) that
 // the desktop uses because there is no reason for a 10 ms frame to cross the
 // FFI boundary a hundred times a second when nothing on the Rust side would
@@ -45,6 +54,12 @@ class WatchAudioEngine;
 //     then RegisterAudioCallback(nullptr)).
 //   * Nothing in AudioDeviceModule is called from the render thread; the
 //     render block only drains a lock-free ring.
+//   * AVAudioEngine configuration changes and audio session interruptions are
+//     observed, and arrive on whatever thread AVFAudio posts them from. They
+//     set a flag and wake the module's pump thread, which is what rebuilds the
+//     graph; a 250 ms poll remains as the fallback. The module still never
+//     sets a category or activates the session -- observing an interruption is
+//     not owning one.
 //
 // Note that WebRTC never calls `Init()` on this route (nothing in
 // WebRtcVoiceEngine or AudioState does), so the engine sets itself up lazily

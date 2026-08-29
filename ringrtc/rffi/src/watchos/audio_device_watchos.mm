@@ -11,7 +11,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <functional>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "api/make_ref_counted.h"
@@ -30,34 +33,46 @@ namespace rffi {
 
 namespace {
 
-// The one format this module declares to the AudioTransport, in both
-// directions. WebRTC's APM resamples internally for its own processing, but
-// the rate handed to (and taken from) the transport has to be the rate that is
-// actually delivered, so it is fixed here and everything else is converted to
-// it. 48 kHz mono is the safe declaration: a native rate for every codec
-// WebRTC will pick, what the watch's own IO runs at in practice, and mono is
-// all a call needs.
-constexpr int kSampleRate = 48000;
+// What this module hands the AudioTransport is mono int16 -- in both
+// directions, always. What it does *not* fix is the rate.
+//
+// AudioTransport takes samples_per_sec on every call and resamples above us
+// (AudioTransportImpl keeps a PushResampler in each direction), so the honest
+// thing to report is the rate the hardware is actually running at, which is
+// also what iOS's ADM does when a route change moves it. Declaring a fixed
+// rate and converting to it would only put a second resampler under the one
+// WebRTC already has, and -- worse -- would leave converted-at-the-old-rate
+// audio in the rings across a route change. So there is no rate conversion in
+// this module at all: only int16 <-> float32 and the channel splat/downmix.
 constexpr size_t kChannels = 1;
-constexpr size_t kFramesPer10ms = kSampleRate / 100;            // 480
 constexpr size_t kBytesPerFrame = kChannels * sizeof(int16_t);  // 2
+
+// A 10 ms block is rate/100 frames, so a rate that is not a whole multiple of
+// 100 has no whole-frame block; such a rate is refused rather than
+// approximated. Nothing we care about is one -- 48000, 44100, 24000 and 16000
+// all divide. kMaxSampleRate is what sizes the fixed 10 ms scratch buffers,
+// and is likewise a refusal rather than a truncation.
+constexpr int kMaxSampleRate = 96000;
+constexpr size_t kMaxFramesPer10ms = kMaxSampleRate / 100;  // 960
 
 // How far ahead of the render block the pump thread keeps the playout ring:
 // deep enough that a late wakeup does not underrun, shallow enough not to add
 // audible latency to a call.
 constexpr double kPlayoutTargetSeconds = 0.030;
 
-// Ring capacities, allocated once. Playout holds hardware-rate float frames,
-// capture holds 48 kHz int16 frames.
-constexpr size_t kPlayoutRingFrames = 96000;  // >= 0.5 s at any plausible rate
-constexpr size_t kCaptureRingFrames = 24000;  // 0.5 s at 48 kHz
+// Ring capacities, allocated once: half a second at the highest rate we
+// accept. Both rings hold mono frames at the engine's current rate -- playout
+// float32, capture int16 -- and both are cleared when that rate changes.
+constexpr size_t kPlayoutRingFrames = kMaxSampleRate / 2;
+constexpr size_t kCaptureRingFrames = kMaxSampleRate / 2;
 
-// Largest render block or converted tap buffer we will handle.
+// Largest render block, or largest tap buffer chunk, we will handle at once.
 constexpr size_t kMaxRenderFrames = 8192;
 
 // Pump cadence, and how often it re-checks a graph that is not running --
 // which covers both "the audio session was not live yet" and "an interruption
-// stopped the engine".
+// stopped the engine". The notifications (see AddObservers) make the common
+// cases immediate; this is the fallback for anything that posts none.
 constexpr int kPumpIntervalMs = 5;
 constexpr int64_t kHealthCheckIntervalMs = 250;
 
@@ -71,6 +86,38 @@ std::string DescribeError(NSError* error) {
   }
   const char* text = error.localizedDescription.UTF8String;
   return text != nullptr ? std::string(text) : std::string("unknown");
+}
+
+// The only sample conversion left in the module: the hardware speaks float32,
+// the transport speaks int16.
+inline float Int16ToFloat(int16_t sample) {
+  return static_cast<float>(sample) * (1.0f / 32768.0f);
+}
+
+inline int16_t FloatToInt16(float sample) {
+  const float scaled = sample * 32768.0f;
+  if (scaled >= 32767.0f) {
+    return 32767;
+  }
+  if (scaled <= -32768.0f) {
+    return -32768;
+  }
+  return static_cast<int16_t>(scaled >= 0.0f ? scaled + 0.5f : scaled - 0.5f);
+}
+
+// Whether a 10 ms block at `rate` is a whole number of frames and fits the
+// fixed scratch buffers. Logs the refusal; the caller does not start that
+// direction.
+bool RateIsUsable(double rate, const char* direction) {
+  const int hz = static_cast<int>(rate);
+  if (static_cast<double>(hz) != rate || hz <= 0 || hz % 100 != 0 ||
+      hz > kMaxSampleRate) {
+    RTC_LOG(LS_ERROR) << "WatchAudioEngine: refusing " << direction << " rate "
+                      << rate << " Hz -- needs a whole 10 ms block at no more "
+                      << "than " << kMaxSampleRate << " Hz";
+    return false;
+  }
+  return true;
 }
 
 // A single-producer/single-consumer ring. Allocation happens once, in the
@@ -116,11 +163,59 @@ class SpscRing {
     return n;
   }
 
+  // Drops everything in the ring. Unlike Read and Write this is NOT safe
+  // against a live counterpart: it moves both cursors, so the caller has to
+  // have quiesced *both* ends first. See EnsureGraph and TeardownGraph, the
+  // only callers: the pump end is the calling thread (or joined), and the
+  // other end is the engine, stopped (playout) or locked out (capture).
+  void Clear() {
+    read_.store(0, std::memory_order_relaxed);
+    write_.store(0, std::memory_order_release);
+  }
+
  private:
   std::vector<T> buf_;
   const size_t capacity_;
   std::atomic<size_t> read_{0};
   std::atomic<size_t> write_{0};
+};
+
+// What the notification blocks capture, instead of `this`.
+//
+// AVFAudio posts on whatever thread it likes, and `removeObserver:` does not
+// wait for a block that has already started running on another one -- so a
+// block that dereferenced the engine directly could outlive it by exactly the
+// window that matters. The blocks hold a shared_ptr to one of these instead;
+// teardown calls Detach, which takes the same lock the block does, so when
+// Detach returns no block is inside the handler and none ever will be again.
+//
+// (The render block, by contrast, does capture raw `this`: its lifetime is
+// guaranteed structurally, by detaching the source node from a stopped engine
+// before the module goes away.)
+class EngineNotice {
+ public:
+  using Handler = std::function<void(const char*, bool)>;
+
+  void Attach(Handler handler) {
+    MutexLock lock(&mutex_);
+    handler_ = std::move(handler);
+  }
+
+  void Detach() {
+    MutexLock lock(&mutex_);
+    handler_ = nullptr;
+  }
+
+  void Post(const char* reason, bool rebuild_now) {
+    MutexLock lock(&mutex_);
+    if (handler_) {
+      handler_(reason, rebuild_now);
+    }
+  }
+
+ private:
+  Mutex mutex_;
+  Handler handler_ RTC_GUARDED_BY(mutex_);
 };
 
 }  // namespace
@@ -131,7 +226,7 @@ class SpscRing {
 // established as the only one that makes sound on a watch under voice
 // processing:
 //
-//   AVAudioSourceNode(hardware format) --> engine.outputNode
+//   AVAudioSourceNode(engine output format) --> engine.outputNode
 //   engine.inputNode --(tap)--> us
 //
 // with `setVoiceProcessingEnabled:` set on the input node *before* any node is
@@ -140,27 +235,47 @@ class SpscRing {
 // under voice processing -- measured on hardware, so the mixer is not in this
 // graph.
 //
+// Rates. The engine's own IO rates are what the transport is told, per call,
+// and playout and capture are tracked separately because nothing guarantees
+// they are equal. A 10 ms block is therefore rate/100 frames rather than a
+// constant, and a route change is a new rate rather than a new converter.
+//
 // The audio session is not ours. LiveCommunicationKit sets the category and
 // activates it; this module never calls setCategory: or setActive:, and has to
 // cope with being started before the session is live -- which presents as an
 // output format with a zero sample rate. That is logged, not asserted, and the
-// pump thread retries.
+// pump thread retries. It does *observe* the session's interruptions, which is
+// not the same as owning it.
 //
-// Locks. `graph_mutex_` covers the engine and the playout converter; the
-// render block never takes it (it only drains a lock-free ring).
-// `capture_mutex_` covers the capture converter alone, and is the only lock
-// the input tap takes -- which is what makes it safe to call `removeTapOnBus:`
-// while holding `graph_mutex_`.
+// Locks. `graph_mutex_` covers the engine and the formats it was built
+// against; the render block never takes it (it only drains a lock-free ring).
+// `capture_mutex_` is taken by the input tap for its whole body and by a
+// rebuild while it clears the capture ring -- which is what makes that clear
+// safe against a tap already in flight, and what makes it safe to call
+// `removeTapOnBus:` while holding `graph_mutex_`.
 class WatchAudioEngine {
  public:
   WatchAudioEngine()
-      : playout_ring_(kPlayoutRingFrames),
+      : notice_(std::make_shared<EngineNotice>()),
+        playout_ring_(kPlayoutRingFrames),
         capture_ring_(kCaptureRingFrames),
-        play_int16_(kFramesPer10ms * kChannels),
-        record_int16_(kFramesPer10ms * kChannels),
-        render_scratch_(kMaxRenderFrames) {}
+        play_int16_(kMaxFramesPer10ms * kChannels),
+        play_float_(kMaxFramesPer10ms * kChannels),
+        record_int16_(kMaxFramesPer10ms * kChannels),
+        capture_int16_(kMaxRenderFrames),
+        render_scratch_(kMaxRenderFrames) {
+    notice_->Attach([this](const char* reason, bool rebuild_now) {
+      OnSessionEvent(reason, rebuild_now);
+    });
+  }
 
-  ~WatchAudioEngine() { Stop(/*playout=*/true, /*recording=*/true); }
+  ~WatchAudioEngine() {
+    Stop(/*playout=*/true, /*recording=*/true);
+    // Belt and braces: Stop has already removed the observers, and this makes
+    // an in-flight block that got in first finish before the members below it
+    // are destroyed.
+    notice_->Detach();
+  }
 
   WatchAudioEngine(const WatchAudioEngine&) = delete;
   WatchAudioEngine& operator=(const WatchAudioEngine&) = delete;
@@ -180,7 +295,14 @@ class WatchAudioEngine {
       recording_wanted_.store(true, std::memory_order_release);
     }
     StartPump();
-    EnsureGraph();
+    // The graph is built by the pump thread, not here: a rebuild clears the
+    // rings, and the pump is the playout ring's producer and the capture
+    // ring's consumer, so the cheapest way to hold both still is for the pump
+    // to be the one doing the rebuilding. Asking it and returning also keeps
+    // WebRTC's worker thread off a wait for a thread that calls back into the
+    // transport. The pump picks this up on its next tick, microseconds away.
+    rebuild_requested_.store(true, std::memory_order_release);
+    pump_wake_.Set();
     return 0;
   }
 
@@ -208,10 +330,12 @@ class WatchAudioEngine {
   }
 
   uint16_t PlayoutDelayMs() const {
-    const double rate = hardware_rate_.load(std::memory_order_acquire);
+    const int rate = playout_rate_.load(std::memory_order_acquire);
     if (rate <= 0) {
       return 0;
     }
+    // The ring holds frames at the playout rate, so this is right at whatever
+    // rate the current route settled on.
     const double buffered_ms = 1000.0 * playout_ring_.Readable() / rate;
     return static_cast<uint16_t>(
         buffered_ms + output_latency_ms_.load(std::memory_order_acquire));
@@ -222,18 +346,94 @@ class WatchAudioEngine {
   }
 
  private:
+  // --------------------------------------------------------- notifications
+
+  // Registered when the engine object is created, removed in TeardownGraph.
+  // Neither block touches `this`: see EngineNotice.
+  //
+  // The session is still not ours. We observe the interruption; we do not set
+  // a category, and on `ended` we re-attempt the graph rather than activating
+  // anything -- the app and LiveCommunicationKit own activation. `object:nil`
+  // on the interruption is deliberate: there is one session on a watch, and
+  // this way the module never so much as names AVAudioSession.
+  void AddObservers() RTC_EXCLUSIVE_LOCKS_REQUIRED(graph_mutex_) {
+    NSNotificationCenter* center = [NSNotificationCenter defaultCenter];
+    std::shared_ptr<EngineNotice> notice = notice_;
+    config_observer_ = [center
+        addObserverForName:AVAudioEngineConfigurationChangeNotification
+                    object:engine_
+                     queue:nil
+                usingBlock:^(NSNotification* note) {
+                  notice->Post("engine configuration changed",
+                               /*rebuild_now=*/true);
+                }];
+    interruption_observer_ = [center
+        addObserverForName:AVAudioSessionInterruptionNotification
+                    object:nil
+                     queue:nil
+                usingBlock:^(NSNotification* note) {
+                  NSNumber* type =
+                      note.userInfo[AVAudioSessionInterruptionTypeKey];
+                  const bool ended =
+                      type != nil && type.unsignedIntegerValue ==
+                                         AVAudioSessionInterruptionTypeEnded;
+                  // On `began` the engine is stopped under us and a rebuild
+                  // would only fail; marking it not-running is the whole job,
+                  // and the health check covers a missed `ended`.
+                  notice->Post(ended ? "audio session interruption ended"
+                                     : "audio session interrupted",
+                               /*rebuild_now=*/ended);
+                }];
+  }
+
+  void RemoveObservers() RTC_EXCLUSIVE_LOCKS_REQUIRED(graph_mutex_) {
+    NSNotificationCenter* center = [NSNotificationCenter defaultCenter];
+    if (config_observer_ != nil) {
+      [center removeObserver:config_observer_];
+      config_observer_ = nil;
+    }
+    if (interruption_observer_ != nil) {
+      [center removeObserver:interruption_observer_];
+      interruption_observer_ = nil;
+    }
+  }
+
+  // Called from a notification block, on whatever thread posted it, with
+  // EngineNotice's lock held: no AVFAudio calls, no graph lock, nothing that
+  // can block. The pump does the actual rebuild on its next tick, which is
+  // now rather than up to kHealthCheckIntervalMs from now.
+  void OnSessionEvent(const char* reason, bool rebuild_now) {
+    RTC_LOG(LS_INFO) << "WatchAudioEngine: " << reason;
+    engine_running_.store(false, std::memory_order_release);
+    if (rebuild_now) {
+      rebuild_requested_.store(true, std::memory_order_release);
+    }
+    pump_wake_.Set();
+  }
+
   // ----------------------------------------------------------------- graph
 
   // Brings the graph up as far as it can, one step at a time, and returns true
   // if the engine is running when it returns. Every step is conditional, so
   // this is both the first-time build and the retry: StartRecording after
-  // StartPlayout adds the tap, and a re-entry after an interruption restarts a
-  // stopped engine.
+  // StartPlayout adds the tap, and a re-entry after an interruption or a route
+  // change rebuilds what the new formats invalidated.
+  //
+  // Pump thread only, and that is load-bearing rather than incidental: a
+  // rebuild clears the rings, SpscRing::Clear is not safe against a live
+  // counterpart, and the pump is the playout ring's producer and the capture
+  // ring's consumer. Running the rebuild *on* the pump is what holds those two
+  // ends still. The other two ends are held explicitly -- the engine is
+  // stopped before the playout ring is cleared, and capture_mutex_ is held
+  // against the tap before the capture ring is. Everything else that wants a
+  // rebuild (Start, a configuration change, an interruption) sets
+  // `rebuild_requested_` and wakes the pump instead of calling this.
   bool EnsureGraph() {
     MutexLock lock(&graph_mutex_);
 
     if (engine_ == nil) {
       engine_ = [[AVAudioEngine alloc] init];
+      AddObservers();
     }
 
     // Before any wiring: this is the AEC (and AGC), and turning it on
@@ -257,41 +457,56 @@ class WatchAudioEngine {
     // The hardware's own format, not a synthesized one. A zero sample rate is
     // how "the audio session is not active yet" presents; that is a retry, not
     // an error.
-    AVAudioFormat* hardware_format = [engine_.outputNode inputFormatForBus:0];
-    if (hardware_format == nil || hardware_format.sampleRate <= 0) {
+    AVAudioFormat* output_format = [engine_.outputNode inputFormatForBus:0];
+    if (output_format == nil || output_format.sampleRate <= 0) {
       RTC_LOG(LS_INFO) << "WatchAudioEngine: output format has no sample rate "
                           "(audio session not active yet); will retry";
       return false;
     }
 
     // A route change (or an interruption) can come back with a different
-    // format, and the engine stops when that happens. Anything built against
-    // the old format has to go: the source node carries its format from
-    // construction, so it is recreated rather than reconnected.
-    const double hardware_rate = hardware_format.sampleRate;
+    // format. Anything built against the old one has to go -- the source node
+    // carries its format from construction, so it is recreated rather than
+    // reconnected -- and so does anything buffered at the old rate.
     if (built_output_format_ == nil ||
-        ![built_output_format_ isEqual:hardware_format]) {
-      RTC_LOG(LS_INFO) << "WatchAudioEngine: hardware output format "
-                       << hardware_rate << " Hz, "
-                       << hardware_format.channelCount << " ch";
+        ![built_output_format_ isEqual:output_format]) {
+      RTC_LOG(LS_INFO) << "WatchAudioEngine: output format "
+                       << output_format.sampleRate << " Hz, "
+                       << output_format.channelCount << " ch";
+      // Stopping first is what quiesces the playout ring's *consumer*, the
+      // render block; its producer is this very thread. With both ends held
+      // the ring can be cleared, which is the point: the ~30 ms sitting in it
+      // was produced for the old rate, and rendering that through a source
+      // node running at the new one is an audible pitch blip on every route
+      // change. A gap is the correct outcome, and is what iOS's
+      // HandleSampleRateChange leaves behind too.
+      if ([engine_ isRunning]) {
+        [engine_ stop];
+      }
+      engine_running_.store(false, std::memory_order_release);
       if (source_node_ != nil) {
         [engine_ detachNode:source_node_];
         source_node_ = nil;
       }
-      if (!BuildPlayoutConverter(hardware_rate)) {
-        return false;
-      }
-      built_output_format_ = hardware_format;
-      hardware_rate_.store(hardware_rate, std::memory_order_release);
+      playout_ring_.Clear();
+      // Remembered even when the rate is refused, so the refusal is logged
+      // once per format rather than at every health check.
+      built_output_format_ = output_format;
+      const bool usable = RateIsUsable(output_format.sampleRate, "playout");
+      const int rate = usable ? static_cast<int>(output_format.sampleRate) : 0;
+      playout_rate_.store(rate, std::memory_order_release);
       playout_target_frames_.store(
-          static_cast<size_t>(hardware_rate * kPlayoutTargetSeconds),
+          static_cast<size_t>(rate * kPlayoutTargetSeconds),
           std::memory_order_release);
+    }
+    if (playout_rate_.load(std::memory_order_acquire) <= 0) {
+      return false;  // Refused above; nothing to render into.
     }
 
     if (source_node_ == nil) {
       WatchAudioEngine* self = this;
       source_node_ = [[AVAudioSourceNode alloc]
-          initWithFormat:hardware_format
+          initWithFormat:output_format
              renderBlock:^OSStatus(BOOL* is_silence,
                                    const AudioTimeStamp* timestamp,
                                    AVAudioFrameCount frame_count,
@@ -303,23 +518,37 @@ class WatchAudioEngine {
       // processing the mixer path is silent. Measured on hardware.
       [engine_ connect:source_node_
                     to:engine_.outputNode
-                format:hardware_format];
+                format:output_format];
     }
 
+    // The capture side, tracked separately: the two rates are usually equal
+    // and nothing promises they will be.
     AVAudioFormat* input_format = [engine_.inputNode outputFormatForBus:0];
-    if (tap_installed_ && (input_format == nil ||
-                           ![built_input_format_ isEqual:input_format])) {
-      // Same story on the capture side: the tap's format is fixed at install.
-      [engine_.inputNode removeTapOnBus:0];
-      tap_installed_ = false;
+    if (built_input_format_ != nil &&
+        ![built_input_format_ isEqual:input_format]) {
+      // Same story: the tap's format is fixed at install, and the ring holds
+      // frames at the old rate.
+      if (tap_installed_) {
+        [engine_.inputNode removeTapOnBus:0];
+        tap_installed_ = false;
+      }
       built_input_format_ = nil;
+      capture_rate_.store(0, std::memory_order_release);
+      ClearCaptureRing();
     }
-    if (!tap_installed_) {
-      if (input_format != nil && input_format.sampleRate > 0) {
-        RTC_LOG(LS_INFO) << "WatchAudioEngine: hardware input format "
+    if (built_input_format_ == nil) {
+      if (input_format == nil || input_format.sampleRate <= 0) {
+        RTC_LOG(LS_WARNING) << "WatchAudioEngine: input format has no sample "
+                               "rate; capture unavailable, will retry";
+      } else {
+        RTC_LOG(LS_INFO) << "WatchAudioEngine: input format "
                          << input_format.sampleRate << " Hz, "
                          << input_format.channelCount << " ch";
-        if (BuildCaptureConverter(input_format)) {
+        built_input_format_ = input_format;
+        if (RateIsUsable(input_format.sampleRate, "capture")) {
+          capture_rate_.store(static_cast<int>(input_format.sampleRate),
+                              std::memory_order_release);
+          ClearCaptureRing();
           WatchAudioEngine* self = this;
           [engine_.inputNode
               installTapOnBus:0
@@ -329,11 +558,7 @@ class WatchAudioEngine {
                           self->OnCapturedBuffer(buffer);
                         }];
           tap_installed_ = true;
-          built_input_format_ = input_format;
         }
-      } else {
-        RTC_LOG(LS_WARNING) << "WatchAudioEngine: input format has no sample "
-                               "rate; capture unavailable, will retry";
       }
     }
 
@@ -360,12 +585,16 @@ class WatchAudioEngine {
     return true;
   }
 
+  // Only ever called with the pump stopped (Stop stops it first), so the
+  // capture ring's consumer is gone, and the tap is removed and the engine
+  // stopped before either ring is cleared.
   void TeardownGraph() {
     MutexLock lock(&graph_mutex_);
     engine_running_.store(false, std::memory_order_release);
     if (engine_ == nil) {
       return;
     }
+    RemoveObservers();
     if (tap_installed_) {
       // Safe under graph_mutex_: the tap block takes capture_mutex_ only.
       [engine_.inputNode removeTapOnBus:0];
@@ -376,91 +605,26 @@ class WatchAudioEngine {
       [engine_ detachNode:source_node_];
       source_node_ = nil;
     }
-    {
-      MutexLock capture_lock(&capture_mutex_);
-      capture_converter_ = nil;
-      capture_out_buffer_ = nil;
-    }
-    playout_converter_ = nil;
-    playout_in_buffer_ = nil;
-    playout_out_buffer_ = nil;
     built_output_format_ = nil;
     built_input_format_ = nil;
     engine_ = nil;
     voice_processing_on_ = false;
-    hardware_rate_.store(0, std::memory_order_release);
+    playout_rate_.store(0, std::memory_order_release);
+    capture_rate_.store(0, std::memory_order_release);
+    // So that a restart does not begin by rendering whatever the last route
+    // left behind, at whatever rate it left it at.
+    playout_ring_.Clear();
+    ClearCaptureRing();
     RTC_LOG(LS_INFO) << "WatchAudioEngine: engine stopped";
   }
 
-  // 48 kHz mono int16 (what the transport hands us) -> mono float32 at the
-  // hardware rate (what the render block writes out). Mono out because the
-  // render block splats the same sample across however many channels the
-  // output node has; a call is mono either way.
-  bool BuildPlayoutConverter(double hardware_rate)
-      RTC_EXCLUSIVE_LOCKS_REQUIRED(graph_mutex_) {
-    AVAudioFormat* from = [[AVAudioFormat alloc]
-        initWithCommonFormat:AVAudioPCMFormatInt16
-                  sampleRate:kSampleRate
-                    channels:static_cast<AVAudioChannelCount>(kChannels)
-                 interleaved:YES];
-    AVAudioFormat* to =
-        [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatFloat32
-                                         sampleRate:hardware_rate
-                                           channels:1
-                                        interleaved:NO];
-    if (from == nil || to == nil) {
-      RTC_LOG(LS_ERROR) << "WatchAudioEngine: could not build playout formats";
-      return false;
-    }
-    playout_converter_ = [[AVAudioConverter alloc] initFromFormat:from
-                                                         toFormat:to];
-    if (playout_converter_ == nil) {
-      RTC_LOG(LS_ERROR) << "WatchAudioEngine: no playout converter "
-                        << kSampleRate << " -> " << hardware_rate;
-      return false;
-    }
-    playout_in_buffer_ = [[AVAudioPCMBuffer alloc]
-        initWithPCMFormat:from
-            frameCapacity:static_cast<AVAudioFrameCount>(kFramesPer10ms)];
-    // One 10 ms block at the hardware rate, plus slack for the resampler's own
-    // framing.
-    const AVAudioFrameCount out_capacity =
-        static_cast<AVAudioFrameCount>(hardware_rate * 0.02) + 64;
-    playout_out_buffer_ =
-        [[AVAudioPCMBuffer alloc] initWithPCMFormat:to
-                                      frameCapacity:out_capacity];
-    return playout_in_buffer_ != nil && playout_out_buffer_ != nil;
-  }
-
-  // Whatever the input node gives us -> 48 kHz mono int16. AVAudioConverter
-  // does the downmix as well as the rate change.
-  bool BuildCaptureConverter(AVAudioFormat* input_format)
-      RTC_EXCLUSIVE_LOCKS_REQUIRED(graph_mutex_) {
-    AVAudioFormat* to = [[AVAudioFormat alloc]
-        initWithCommonFormat:AVAudioPCMFormatInt16
-                  sampleRate:kSampleRate
-                    channels:static_cast<AVAudioChannelCount>(kChannels)
-                 interleaved:YES];
-    if (to == nil) {
-      return false;
-    }
-    AVAudioConverter* converter =
-        [[AVAudioConverter alloc] initFromFormat:input_format toFormat:to];
-    if (converter == nil) {
-      RTC_LOG(LS_ERROR) << "WatchAudioEngine: no capture converter "
-                        << input_format.sampleRate << " -> " << kSampleRate;
-      return false;
-    }
-    AVAudioPCMBuffer* buffer = [[AVAudioPCMBuffer alloc]
-        initWithPCMFormat:to
-            frameCapacity:static_cast<AVAudioFrameCount>(kMaxRenderFrames)];
-    if (buffer == nil) {
-      return false;
-    }
-    MutexLock capture_lock(&capture_mutex_);
-    capture_converter_ = converter;
-    capture_out_buffer_ = buffer;
-    return true;
+  // The capture ring's producer is the tap, which holds capture_mutex_ for its
+  // whole body; its consumer is the pump, which is either the caller itself
+  // (EnsureGraph) or already joined (TeardownGraph, which Stop calls after
+  // StopPump). Both ends held, so the clear is safe.
+  void ClearCaptureRing() RTC_EXCLUSIVE_LOCKS_REQUIRED(graph_mutex_) {
+    MutexLock lock(&capture_mutex_);
+    capture_ring_.Clear();
   }
 
   bool EngineIsRunning() {
@@ -532,136 +696,112 @@ class WatchAudioEngine {
     return noErr;
   }
 
-  // Pulls one 10 ms block from the transport, converts it to the hardware
-  // rate, and pushes it into the playout ring. Pump thread only.
+  // Pulls one 10 ms block from the transport -- at the playout rate, which is
+  // the engine's own -- and pushes it into the playout ring as float. Pump
+  // thread only, and takes no lock: the rate is an atomic and the ring is
+  // lock-free, and a rebuild cannot be running concurrently because a rebuild
+  // is this same thread.
   bool PushOnePlayoutBlock() {
     AudioTransport* transport = transport_.load(std::memory_order_acquire);
     if (transport == nullptr) {
       return false;
     }
+    const int rate = playout_rate_.load(std::memory_order_acquire);
+    if (rate <= 0) {
+      return false;
+    }
+    const size_t frames = static_cast<size_t>(rate) / 100;
     size_t samples_out = 0;
     int64_t elapsed_time_ms = -1;
     int64_t ntp_time_ms = -1;
     if (transport->NeedMorePlayData(
-            kFramesPer10ms, kBytesPerFrame, kChannels, kSampleRate,
+            frames, kBytesPerFrame, kChannels, static_cast<uint32_t>(rate),
             play_int16_.data(), samples_out, &elapsed_time_ms,
             &ntp_time_ms) != 0) {
       return false;
     }
+    samples_out = std::min(samples_out, play_int16_.size());
     if (samples_out == 0) {
       return false;
     }
-
-    MutexLock lock(&graph_mutex_);
-    if (playout_converter_ == nil || playout_in_buffer_ == nil ||
-        playout_out_buffer_ == nil) {
-      return false;
+    for (size_t index = 0; index < samples_out; ++index) {
+      play_float_[index] = Int16ToFloat(play_int16_[index]);
     }
-    playout_in_buffer_.frameLength =
-        static_cast<AVAudioFrameCount>(samples_out);
-    std::memcpy(playout_in_buffer_.int16ChannelData[0], play_int16_.data(),
-                samples_out * sizeof(int16_t));
-
-    AVAudioPCMBuffer* in_buffer = playout_in_buffer_;
-    __block BOOL provided = NO;
-    AVAudioConverterInputBlock input_block =
-        ^AVAudioBuffer*(AVAudioPacketCount packets,
-                        AVAudioConverterInputStatus* status) {
-          if (provided) {
-            *status = AVAudioConverterInputStatus_NoDataNow;
-            return nil;
-          }
-          provided = YES;
-          *status = AVAudioConverterInputStatus_HaveData;
-          return in_buffer;
-        };
-
-    playout_out_buffer_.frameLength = playout_out_buffer_.frameCapacity;
-    NSError* error = nil;
-    const AVAudioConverterOutputStatus status =
-        [playout_converter_ convertToBuffer:playout_out_buffer_
-                                      error:&error
-                         withInputFromBlock:input_block];
-    if (status == AVAudioConverterOutputStatus_Error) {
-      RTC_LOG(LS_WARNING) << "WatchAudioEngine: playout conversion failed: "
-                          << DescribeError(error);
-      return false;
-    }
-    const AVAudioFrameCount produced = playout_out_buffer_.frameLength;
-    if (produced == 0) {
-      return false;
-    }
-    playout_ring_.Write(playout_out_buffer_.floatChannelData[0], produced);
+    playout_ring_.Write(play_float_.data(), samples_out);
     return true;
   }
 
   // --------------------------------------------------------------- capture
 
   // The input tap. Runs on the engine's capture thread -- not the render
-  // thread, so the converter is allowed here; the transport (and with it the
-  // APM) is not, which is what the ring is for.
+  // thread, so a lock is allowed here; the transport (and with it the APM) is
+  // not, which is what the ring is for.
+  //
+  // N channels down to mono and float32 down to int16, both by hand: there is
+  // no rate change to make, because the ring and the transport are both at the
+  // engine's own capture rate.
   void OnCapturedBuffer(AVAudioPCMBuffer* buffer) {
     if (buffer == nil || buffer.frameLength == 0) {
       return;
     }
+    const float* const* channel_data = buffer.floatChannelData;
+    const size_t channel_count =
+        static_cast<size_t>(buffer.format.channelCount);
+    if (channel_data == nullptr || channel_count == 0) {
+      RTC_LOG(LS_WARNING) << "WatchAudioEngine: tap buffer is not float PCM; "
+                             "dropping";
+      return;
+    }
+    // `stride` is the gap between one channel's consecutive samples, which is
+    // what makes this loop cover interleaved and planar buffers alike.
+    const size_t stride = static_cast<size_t>(buffer.stride);
+    const size_t frames = static_cast<size_t>(buffer.frameLength);
+    const float gain = 1.0f / static_cast<float>(channel_count);
+
     MutexLock lock(&capture_mutex_);
-    if (capture_converter_ == nil || capture_out_buffer_ == nil) {
-      return;
+    for (size_t done = 0; done < frames;) {
+      const size_t chunk = std::min(frames - done, kMaxRenderFrames);
+      for (size_t frame = 0; frame < chunk; ++frame) {
+        float sum = 0.0f;
+        for (size_t channel = 0; channel < channel_count; ++channel) {
+          sum += channel_data[channel][(done + frame) * stride];
+        }
+        capture_int16_[frame] = FloatToInt16(sum * gain);
+      }
+      capture_ring_.Write(capture_int16_.data(), chunk);
+      done += chunk;
     }
-
-    AVAudioPCMBuffer* in_buffer = buffer;
-    __block BOOL provided = NO;
-    AVAudioConverterInputBlock input_block =
-        ^AVAudioBuffer*(AVAudioPacketCount packets,
-                        AVAudioConverterInputStatus* status) {
-          if (provided) {
-            *status = AVAudioConverterInputStatus_NoDataNow;
-            return nil;
-          }
-          provided = YES;
-          *status = AVAudioConverterInputStatus_HaveData;
-          return in_buffer;
-        };
-
-    capture_out_buffer_.frameLength = capture_out_buffer_.frameCapacity;
-    NSError* error = nil;
-    const AVAudioConverterOutputStatus status =
-        [capture_converter_ convertToBuffer:capture_out_buffer_
-                                      error:&error
-                         withInputFromBlock:input_block];
-    if (status == AVAudioConverterOutputStatus_Error) {
-      RTC_LOG(LS_WARNING) << "WatchAudioEngine: capture conversion failed: "
-                          << DescribeError(error);
-      return;
-    }
-    const AVAudioFrameCount produced = capture_out_buffer_.frameLength;
-    if (produced == 0) {
-      return;
-    }
-    capture_ring_.Write(capture_out_buffer_.int16ChannelData[0], produced);
   }
 
-  // Hands one 10 ms block to the transport. Pump thread only.
+  // Hands one 10 ms block to the transport, at the capture rate. Pump thread
+  // only.
   bool DeliverOneCaptureBlock() {
     AudioTransport* transport = transport_.load(std::memory_order_acquire);
     if (transport == nullptr) {
       return false;
     }
-    if (capture_ring_.Readable() < kFramesPer10ms) {
+    const int rate = capture_rate_.load(std::memory_order_acquire);
+    if (rate <= 0) {
       return false;
     }
-    capture_ring_.Read(record_int16_.data(), kFramesPer10ms);
+    const size_t frames = static_cast<size_t>(rate) / 100;
+    if (capture_ring_.Readable() < frames) {
+      return false;
+    }
+    capture_ring_.Read(record_int16_.data(), frames);
 
     // What the AEC needs: how long ago the far-end audio we are still holding
     // will actually be heard, plus how long ago the near-end audio we are
-    // handing over was actually captured.
+    // handing over was actually captured. Both terms are computed at the rate
+    // the ring they describe is running at.
     const uint32_t total_delay_ms = static_cast<uint32_t>(
         PlayoutDelayMs() + input_latency_ms_.load(std::memory_order_acquire) +
-        1000.0 * capture_ring_.Readable() / kSampleRate);
+        1000.0 * capture_ring_.Readable() / rate);
     uint32_t new_mic_level = 0;
     transport->RecordedDataIsAvailable(
-        record_int16_.data(), kFramesPer10ms, kBytesPerFrame, kChannels,
-        kSampleRate, total_delay_ms, /*clockDrift=*/0, /*currentMicLevel=*/0,
+        record_int16_.data(), frames, kBytesPerFrame, kChannels,
+        static_cast<uint32_t>(rate), total_delay_ms, /*clockDrift=*/0,
+        /*currentMicLevel=*/0,
         /*keyPressed=*/false, new_mic_level,
         /*estimatedCaptureTimeNS=*/std::nullopt);
     return true;
@@ -669,8 +809,10 @@ class WatchAudioEngine {
 
   // Keeps the capture ring from filling up while nobody is listening.
   void DiscardCapturedAudio() {
-    while (capture_ring_.Readable() >= kFramesPer10ms) {
-      capture_ring_.Read(record_int16_.data(), kFramesPer10ms);
+    while (capture_ring_.Readable() > 0) {
+      capture_ring_.Read(record_int16_.data(),
+                         std::min(capture_ring_.Readable(),
+                                  record_int16_.size()));
     }
   }
 
@@ -700,17 +842,24 @@ class WatchAudioEngine {
   // drains whatever the tap captured into the transport. Both are paced by the
   // hardware -- the ring levels are the clock -- so a 5 ms poll is enough.
   //
-  // It is also what makes a not-yet-active audio session survivable: if the
-  // graph is not running it retries every kHealthCheckIntervalMs, which covers
-  // both a session that goes live after WebRTC has already asked us to start
-  // and an engine stopped by an interruption.
+  // It is also the only thread that ever builds or rebuilds the graph, which
+  // is what makes a not-yet-active audio session survivable and what makes the
+  // ring clears on a route change safe (see EnsureGraph). Start, a
+  // configuration change and an interruption all just set `rebuild_requested_`
+  // and wake it; failing every notification, it re-checks a graph that is not
+  // running every kHealthCheckIntervalMs.
   void PumpLoop() {
     int64_t next_health_check_ms = 0;
     while (pump_running_.load(std::memory_order_acquire)) {
+      const bool disturbed =
+          rebuild_requested_.exchange(false, std::memory_order_acq_rel);
       const int64_t now_ms = TimeMillis();
-      if (now_ms >= next_health_check_ms) {
+      if (disturbed || now_ms >= next_health_check_ms) {
         next_health_check_ms = now_ms + kHealthCheckIntervalMs;
-        if (!EngineIsRunning()) {
+        // A configuration change can leave the engine running at a new format,
+        // so a notification rebuilds unconditionally; the poll only rebuilds
+        // what has actually fallen over.
+        if (disturbed || !EngineIsRunning()) {
           engine_running_.store(false, std::memory_order_release);
           EnsureGraph();
         }
@@ -747,25 +896,29 @@ class WatchAudioEngine {
   mutable Mutex graph_mutex_;
   AVAudioEngine* engine_ RTC_GUARDED_BY(graph_mutex_) = nil;
   AVAudioSourceNode* source_node_ RTC_GUARDED_BY(graph_mutex_) = nil;
-  AVAudioConverter* playout_converter_ RTC_GUARDED_BY(graph_mutex_) = nil;
-  AVAudioPCMBuffer* playout_in_buffer_ RTC_GUARDED_BY(graph_mutex_) = nil;
-  AVAudioPCMBuffer* playout_out_buffer_ RTC_GUARDED_BY(graph_mutex_) = nil;
+  id config_observer_ RTC_GUARDED_BY(graph_mutex_) = nil;
+  id interruption_observer_ RTC_GUARDED_BY(graph_mutex_) = nil;
   bool tap_installed_ RTC_GUARDED_BY(graph_mutex_) = false;
   bool voice_processing_on_ RTC_GUARDED_BY(graph_mutex_) = false;
   // The formats the graph was actually built against, so a route change that
   // moves them is noticed rather than silently rendered at the wrong rate.
+  // Also remembered when a format is refused, so the refusal logs once.
   AVAudioFormat* built_output_format_ RTC_GUARDED_BY(graph_mutex_) = nil;
   AVAudioFormat* built_input_format_ RTC_GUARDED_BY(graph_mutex_) = nil;
 
   mutable Mutex capture_mutex_;
-  AVAudioConverter* capture_converter_ RTC_GUARDED_BY(capture_mutex_) = nil;
-  AVAudioPCMBuffer* capture_out_buffer_ RTC_GUARDED_BY(capture_mutex_) = nil;
+
+  // Outlives the observer blocks; see EngineNotice.
+  const std::shared_ptr<EngineNotice> notice_;
 
   std::atomic<AudioTransport*> transport_{nullptr};
   std::atomic<bool> playout_wanted_{false};
   std::atomic<bool> recording_wanted_{false};
   std::atomic<bool> engine_running_{false};
-  std::atomic<double> hardware_rate_{0};
+  // The engine's IO rates, which are what the transport is told. Zero means
+  // "not established (or refused)": that direction does not run.
+  std::atomic<int> playout_rate_{0};
+  std::atomic<int> capture_rate_{0};
   std::atomic<size_t> playout_target_frames_{0};
   std::atomic<double> output_latency_ms_{0};
   std::atomic<double> input_latency_ms_{0};
@@ -777,10 +930,15 @@ class WatchAudioEngine {
   SpscRing<int16_t> capture_ring_;
 
   std::vector<int16_t> play_int16_;    // pump thread only
+  std::vector<float> play_float_;      // pump thread only
   std::vector<int16_t> record_int16_;  // pump thread only
+  std::vector<int16_t> capture_int16_; // capture (tap) thread only
   std::vector<float> render_scratch_;  // render thread only
 
   std::atomic<bool> pump_running_{false};
+  // Set by Start and by the notification handlers; cleared by the pump, which
+  // is the only thread that rebuilds the graph.
+  std::atomic<bool> rebuild_requested_{false};
   Event pump_wake_;
   PlatformThread pump_thread_;
 };
