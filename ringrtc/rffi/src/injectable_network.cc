@@ -9,6 +9,7 @@
 #include "api/packet_socket_factory.h"
 #include "api/transport/network_types.h"
 #include "p2p/client/basic_port_allocator.h"
+#include "rtc_base/async_dns_resolver.h"
 #include "rffi/api/network.h"
 #include "rtc_base/ip_address.h"
 #include "rtc_base/network/received_packet.h"
@@ -341,9 +342,16 @@ class InjectableNetworkImpl : public InjectableNetwork,
 
   // As PacketSocketFactory
   std::unique_ptr<AsyncDnsResolverInterface> CreateAsyncDnsResolver() override {
-    // TODO: Add support for DNS-based STUN/TURN servers.
-    // For now, just use IP addresses
-    return nullptr;
+    // The default getaddrinfo-backed resolver, as BasicPacketSocketFactory
+    // creates. The injectable network replaces the OS *packet* sockets, but
+    // name resolution is not one: it can stay platform-native everywhere the
+    // injectable network runs (on watchOS, getaddrinfo rides mDNSResponder
+    // over XPC and works during the call-time network grant -- measured
+    // 2026-08-31 while BSD send/recv was refused). Returning nullptr here
+    // (as this method did) is not "IP addresses only": UDPPort::PrepareAddress
+    // calls Start() on the resolver unchecked, so any hostname ICE server
+    // (e.g. stun:stun.voip.signal.org) was a segfault on the network thread.
+    return std::make_unique<AsyncDnsResolver>();
   }
 
  private:
