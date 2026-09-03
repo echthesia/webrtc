@@ -178,6 +178,9 @@ class InjectableNetworkImpl : public InjectableNetwork,
       // TODO: Add more than one IP per network interface
       interface->AddIP(IpToRtcIp(ip));
       interface->set_preference(preference);
+      // A name already present is replaced (an interface whose address
+      // moved), its old Network retired rather than freed: see Retire.
+      Retire(name);
       interface_by_name_.insert({std::move(name), std::move(interface)});
       NotifyNetworksChanged();
     });
@@ -188,8 +191,14 @@ class InjectableNetworkImpl : public InjectableNetwork,
                      << name;
     // We need to access interface_by_name_ on the network_thread_.
     // Make sure to copy the name first!
-    network_thread_->PostTask(
-        [this, name{std::string(name)}] { interface_by_name_.erase(name); });
+    network_thread_->PostTask([this, name{std::string(name)}] {
+      if (Retire(name)) {
+        // BasicPortAllocatorSession::OnNetworksChanged marks the sequences
+        // whose Network is no longer in GetNetworks() as failed and prunes
+        // their ports; without this, a removed interface's ports live on.
+        NotifyNetworksChanged();
+      }
+    });
   }
 
   void ReceiveUdp(IpPort source,
@@ -357,7 +366,27 @@ class InjectableNetworkImpl : public InjectableNetwork,
  private:
   const Environment env_;
   Thread* network_thread_;
+  // Takes `name` out of interface_by_name_, keeping its Network alive in
+  // retired_interfaces_. Ports and connections hold raw Network pointers
+  // (Port::network_, read for logging, cost and candidate names) for as long
+  // as they exist, so freeing a Network while a PeerConnection is alive is a
+  // use-after-free; BasicNetworkManager keeps inactive networks for the same
+  // reason. Returns whether there was one. Network thread only.
+  bool Retire(const std::string& name) {
+    RTC_DCHECK(network_thread_->IsCurrent());
+    auto it = interface_by_name_.find(name);
+    if (it == interface_by_name_.end()) {
+      return false;
+    }
+    retired_interfaces_.push_back(std::move(it->second));
+    interface_by_name_.erase(it);
+    return true;
+  }
+
   std::map<std::string, std::unique_ptr<Network>> interface_by_name_;
+  // Networks removed or replaced; alive until the manager goes, never
+  // returned by GetNetworks(). One entry per path change, at most.
+  std::vector<std::unique_ptr<Network>> retired_interfaces_;
   std::map<SocketAddress, InjectableUdpSocket*> udp_socket_by_local_address_;
   // The ICE stack does not like ports below 1024.
   // Give it a nice even number to count up from.
